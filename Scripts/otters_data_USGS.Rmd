@@ -1,0 +1,508 @@
+---
+title: "otters_data_USGS"
+output: html_document
+  html_document:
+    toc: true
+    toc_float: true
+date: "2026-11-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(here)
+library(tidyverse)
+library(sf)
+sf_use_s2(FALSE)   # planar ops are fine at this scale; avoids s2 validity errors on old polygons
+```
+
+# 1. What is in `Data/otters_USGS`?
+Exploring data packages from USGS (various citations) and listing data files used: 
+
+Hatfield, B.B., Yee, J.L., Kenner, M.C., and Tomoleoni, J.A., 2019, Annual California sea otter census - 2019 spring census summary: U.S. Geological Survey data release, https://doi.org/10.5066/P9B2KNB3.
+
+Tinker, M.T., and Hatfield, B.B., 2018, Annual California sea otter census—1985-2014 spring census summary: U.S. Geological Survey data release, https://doi.org/10.5066/F7445JQ5.
+
+Hatfield, B.B., Yee, J.L., Kenner, M.C., Tomoleoni, J.A., and Tinker, M.T., 2018, Annual California sea otter census—2018 spring census summary: U.S. Geological Survey data release, https://doi.org/10.5066/P98012HE.
+
+Tinker, M.T., and Hatfield, B.B., 2017, Annual California sea otter census—2017 spring census summary: U.S. Geological Survey data release, https://doi.org/10.5066/F7R2109J.
+
+Tinker, M.T., and Hatfield, B.B., 2016, Annual California Sea Otter Census - 2016 Spring Census Summary: U.S. Geological Survey data release, http://dx.doi.org/10.5066/F7FJ2DWJ.
+
+Tinker, M.T., and Hatfield, B.B., 2015, Southwest U.S. Southern sea otter annual range-wide census results: U.S. Geological Survey data release, http://dx.doi.org/10.5066/F7F47M5C.
+
+
+| File | What it is | Years | Geometry? |
+|---|---|---|---|
+| `5a32d390e4b08e6a89d88583.csv` | Census-summary **time series**: one row per habitat polygon x year (ScienceBase item `5a32d390e4b08e6a89d88583`) | 1985-2014 (no 2011) | **No.** Attributes only, keyed by `POLY_ID` |
+| `Spring2014_SeaOtterCensus/Census_sum_14.shp` | 2014 census-summary polygons | 2014 | Polygons, CA Teale Albers (EPSG:3310) |
+| `Spring2014_SeaOtterCensus/Census_sum.xls` | Same attributes as the 2014 shapefile, as a table | 2014 | No |
+| `Spring2014_SeaOtterCensus/Range_counts.xls` | **Raw** 2014 spring count per ATOS point (single year, not averaged) | 2014 | No (ATOS id only) |
+| `Spring2014_SeaOtterCensus/Extra_limit_obs_14.shp` / `Extra_lim_counts.xls` | 3 otters seen outside the official range limits | 2014 | Points (has lat/long) |
+| `Spring2014_SeaOtterCensus/Range_extent_14.shp` | Line showing the 2014 mainland range | 2014 | Line |
+| `Census_sum_2019/Census_sum_2019.shp` | 2019 census-summary polygons | 2019 | Polygons, EPSG:3310 |
+
+
+## from the FGDC metadata (`*_FGDC.xml`)
+
+* **ATOS** ("As The Otter Swims") points are spaced about every 500 m along the coast. ATOS 0 is at the Golden Gate and ATOS 2024 at the Mexico border, and the numbers increase from north to south.
+* Each ATOS point has up to two habitat **polygons**. `ZONE_CODE` **n** is nearshore (0 to 30 m depth). **o** is offshore (30 to 60 m, or within 10 km of shore). There are also a few **b** (bay/slough) and **w** (way offshore) polygons. `POLY_ID` / `HAB_ID` = ATOS id + zone letter, e.g. `321n`.
+* **`dens_sm`**: the *3-year average* number of otters per km^2 in the polygon, smoothed over 10 km of coastline.
+* **`lin_dens`**: the *3-year average* otters per ATOS segment, also 10 km-smoothed. It is shared by the n and o polygons of one ATOS.
+* **`pupratio`**: pups / independents, 3-yr average, smoothed.
+* **`trend5yr`**: the local exponential growth rate over the previous 5 years, smoothed.
+* `AREA` is in km^2, `PERIMETER` in km.
+
+> **caveat:** these files do **not** contain raw counts (except
+> `Range_counts.xls`). Every polygon value is *already* a 3-year running
+> average. So the **2019 file is the 2017-2019 average**, (the
+> index USGS and USFWS recommend).
+
+# 2. read csvs
+
+```{r read}
+otter_dir <- here::here("Data", "otters_USGS")
+
+census_ts <- read_csv(file.path(otter_dir, "5a32d390e4b08e6a89d88583.csv"))
+
+shp14 <- st_read(file.path(otter_dir, "Spring2014_SeaOtterCensus", "Census_sum_14.shp"), quiet = TRUE)
+shp19 <- st_read(file.path(otter_dir, "Census_sum_2019", "Census_sum_2019.shp"), quiet = TRUE)
+
+```
+
+## Read every yearly census-summary shapefile
+
+USGS releases one summary shapefile per year, and the folder/file names and column names vary a little between releases. Rather than reading each year by hand, the function below:
+
+* finds **every** `.shp` under `Data/otters_USGS/` and keeps only the census summaries (files with a density column). The range-extent and extra-limit files are skipped.
+* matches column names case-insensitively (`dens_sm` = `DENS_SM`) and uses `HAB_ID` when `POLY_ID` is missing.
+* takes the year from the `Year` column. If that is missing, it reads it from the file name (`2018` or `_15` -> 2015).
+* returns a table with the same columns as the CSV time series, so the two can be stacked.
+
+Adding a new year later = drop its folder into `Data/otters_USGS/` and re-knit. No code changes.
+
+```{r read-all-summaries}
+std_cols <- c("Year", "POLY_ID", "HAB_ID", "ATOS_ID", "ZONE_CODE", "AREA",
+              "dens_sm", "lin_dens", "pupratio", "trend5yr")
+
+read_census_summary <- function(f) {
+  d <- st_drop_geometry(st_read(f, quiet = TRUE))
+
+  # case-insensitive rename to the standard column names
+  for (nm in std_cols) {
+    hit <- names(d)[tolower(names(d)) == tolower(nm)]
+    if (length(hit) == 1 && hit != nm) names(d)[names(d) == hit] <- nm
+  }
+  if (!"dens_sm" %in% names(d)) return(NULL)        # not a census summary (range line, extra-limit points)
+
+  if (!"POLY_ID" %in% names(d)) d$POLY_ID <- d$HAB_ID
+  if (!"AREA" %in% names(d) && "HECTARES" %in% names(d)) d$AREA <- d$HECTARES / 100   # km^2
+
+  # year: from the data if present, otherwise from the file name
+  if (!"Year" %in% names(d) || all(is.na(d$Year))) {
+    yr4 <- str_extract(basename(f), "(19|20)\\d{2}")
+    yr2 <- str_match(basename(f), "_(\\d{2})\\.shp$")[, 2]
+    d$Year <- if (!is.na(yr4)) as.numeric(yr4) else 2000 + as.numeric(yr2)
+  }
+
+  for (nm in setdiff(std_cols, names(d))) d[[nm]] <- NA   # e.g. a release without trend5yr
+
+  d %>%
+    transmute(Year = as.numeric(Year), POLY_ID = as.character(POLY_ID),
+              ATOS_ID = as.numeric(ATOS_ID), ZONE_CODE, AREA = as.numeric(AREA),
+              dens_sm, lin_dens, pupratio, trend5yr,
+              source = file.path(basename(dirname(f)), basename(f)))
+}
+
+shp_files  <- list.files(otter_dir, pattern = "\\.shp$", recursive = TRUE, full.names = TRUE)
+census_shp <- map_dfr(shp_files, read_census_summary)
+
+# What was found (one row per file)
+census_shp %>%
+  group_by(Year, source) %>%
+  summarise(n_polygons = n(), index_3yr = round(sum(dens_sm * AREA)), .groups = "drop") %>%
+  arrange(Year)
+
+# If two files claim the same year, keep the first and say so
+dup_years <- census_shp %>% distinct(Year, source) %>% count(Year) %>% filter(n > 1)
+if (nrow(dup_years) > 0) warning("More than one shapefile for year(s): ",
+                                 paste(dup_years$Year, collapse = ", "), ". Keeping the first.")
+census_shp <- census_shp %>%
+  group_by(Year) %>% filter(source == first(source)) %>% ungroup()
+
+# One long table, all years: CSV for 1985-2014, shapefiles for every year the CSV doesn't have
+census_all <- census_ts %>%
+  transmute(Year, POLY_ID, ATOS_ID, ZONE_CODE, AREA, dens_sm, lin_dens, pupratio, trend5yr,
+            source = "CSV time series") %>%
+  bind_rows(filter(census_shp, !Year %in% census_ts$Year)) %>%
+  mutate(otters_3yr = dens_sm * AREA,
+         avg_window = paste0(Year - 2, "-", Year)) %>%
+  arrange(Year)
+
+census_all %>% count(Year, source) %>% print(n = Inf)
+```
+
+**Check that AREA means the same thing in every release.** AREA should be km^2 everywhere. If a release used different units, the ratio to the 2019 polygon areas would be far from 1 and its index would be off by that factor.
+
+```{r area-check}
+census_all %>%
+  inner_join(st_drop_geometry(shp19) %>% select(POLY_ID = HAB_ID, AREA_2019 = AREA), by = "POLY_ID") %>%
+  group_by(Year) %>%
+  summarise(median_area_ratio = round(median(AREA / AREA_2019), 3)) %>%
+  filter(Year >= 2010)
+```
+## structure checks
+
+```{r structure}
+# rows (polygons) per year in the time series
+census_ts %>% count(Year) %>% print(n = Inf)
+
+# 2019 columns differ slightly: it has 'id' and no 'POLY_ID' / 'Sect_ID'
+setdiff(names(shp14), names(shp19))
+setdiff(names(shp19), names(shp14))
+
+# Same polygon IDs?  Is every 2014 polygon also in 2019?
+all(shp14$HAB_ID %in% shp19$HAB_ID)
+setdiff(shp19$HAB_ID, shp14$HAB_ID)   # extra 2019 polys = range expansion (south end)
+
+# Does the CSV's 2014 slice equal the 2014 shapefile?
+census_ts %>% filter(Year == 2014) %>%
+  inner_join(st_drop_geometry(shp14) %>% select(POLY_ID, dens_sm_shp = dens_sm), by = "POLY_ID") %>%
+  summarise(n = n(), max_abs_diff = max(abs(dens_sm - dens_sm_shp)))
+```
+So the CSV and the shapefiles share **one polygon framework**: the same `POLY_ID`/`HAB_ID` and the same shapes. You can attach geometry to any CSV year by joining on `POLY_ID`.
+
+## sanity check: density x area ~ the 3-year population index
+since density is a per km sq index, I wnat the overall pop back per polygon (unit area)
+
+```{r index-check}
+index_ts <- census_all %>%
+  group_by(Year) %>%
+  summarise(index_3yr = sum(otters_3yr))
+
+index_ts %>% tail(8)
+
+# years with no point, for the subtitle
+missing_years <- setdiff(min(index_ts$Year):max(index_ts$Year), index_ts$Year)
+
+ggplot(index_ts, aes(Year, index_3yr)) +
+  # marine heatwave band, drawn first so it sits behind the line and points
+  annotate("rect", xmin = 2014, xmax = 2015, ymin = -Inf, ymax = Inf,
+           fill = "red", alpha = 0.15) +
+
+  geom_line() + geom_point() +
+  
+  # a tick for every year, but a label only every 5 years
+  scale_x_continuous(breaks = seq(1985, 2020, 5),
+                     minor_breaks = 1985:2020,
+                     expand = expansion(mult = 0.01)) +
+  guides(x = guide_axis(minor.ticks = TRUE)) +
+  theme_minimal() +
+  
+  labs(y = "Sum of dens_sm x AREA (otters)",
+       title = "Mainland 3-yr average index rebuilt from polygon densities",
+       subtitle = if (length(missing_years) > 0)
+         paste0("No data for: ", paste(missing_years, collapse = ", "), " (red band = MHW)") else NULL) +
+
+  theme(axis.ticks.x = element_line(colour = "grey30"),
+        axis.ticks.length.x = unit(4, "pt"),
+        axis.minor.ticks.length.x = rel(0.8),   # yearly ticks a bit shorter than the 5-yr ones
+        panel.grid.minor.x = element_blank())   # no yearly gridlines
+
+#ggsave(here::here("Outputs", "otters", "Total_popluation_avgs.png"), width = 9, height = 7)
+```
+
+The sums come out at about 2,881 for 2014 and 2,863 for 2019. These are the published *mainland* 3-year averages (the headline USGS numbers also add San Nicolas Island). This confirms that **`dens_sm x AREA` = the 3-yr average otters in each polygon**.
+
+
+# 3. otters at lat/long positions
+
+There are two sensible spatial units:
+1. **Polygon centroid** (n and o separately). This keeps the inshore/offshore split.
+2. **ATOS point** (n + o summed). One point every 500 m along the coast, which is usually the most useful for joining to survey sites.
+
+I use `st_point_on_surface()` instead of `st_centroid()` so that every point falls inside its (often curved) polygon.
+
+```{r latlong-2019}
+otters_2019_poly <- shp19 %>%
+  rename(POLY_ID = HAB_ID) %>%
+  mutate(otters_3yr = dens_sm * AREA,     # 3-yr avg otters in polygon (2017-2019)
+         avg_window = "2017-2019") %>%
+  st_point_on_surface() %>%
+  st_transform(4326) %>%
+  mutate(lon = st_coordinates(.)[, 1],
+         lat = st_coordinates(.)[, 2])
+
+# Collapse to ATOS points (sum n + o). The geometry is the mean of the polygon points.
+otters_2019_atos <- otters_2019_poly %>%
+  group_by(ATOS_ID) %>%
+  summarise(otters_3yr = sum(otters_3yr),
+            lin_dens   = first(lin_dens),   # alt. per-ATOS index (excludes bay polys)
+            pupratio   = first(pupratio),
+            trend5yr   = first(trend5yr),
+            do_union = TRUE) %>%
+  st_centroid() %>%
+  mutate(lon = st_coordinates(.)[, 1],
+         lat = st_coordinates(.)[, 2],
+         Year = 2019, avg_window = "2017-2019")
+
+head(st_drop_geometry(otters_2019_atos))
+
+# compare the two per-ATOS measures
+otters_2019_atos %>% st_drop_geometry() %>%
+  mutate(diff = otters_3yr - lin_dens) %>%
+  summarise(total_area_based = sum(otters_3yr), total_lin_dens = sum(lin_dens),
+            median_abs_diff = median(abs(diff)), max_abs_diff = max(abs(diff)))
+otters_2019_atos %>% st_drop_geometry() %>%
+  mutate(diff = otters_3yr - lin_dens) %>% arrange(desc(abs(diff))) %>% head(4)
+```
+**Area-based (`dens_sm x AREA`) vs `lin_dens`.** Range-wide the two totals are the same, but at single ATOS points they differ (median ~ 0.3 otters).
+
+* The large differences are the **bay polygons**: ATOS 321 (Elkhorn Slough, about 100 otters) and ATOS 826 (Morro Bay). `lin_dens` leaves those otters out of the coastline value.
+* Elsewhere, the 10 km smoothing spreads otters a little differently between neighbouring points. This doesn't matter once you sum over a few km.
+
+Use `otters_3yr` (area-based) if you want bay otters included.
+
+**Basemaps.** Free state outlines (e.g. the `maps` package) are too coarse for this coastline: they put the shore 1-3 km from where it really is, so points look like they sit on land. The zoomed maps use **USGS habitat polygons themselves** as the background so they line up exactly with the points. The landward edge of the nearshore polygons is the shoreline, and the bay polygons trace Elkhorn Slough and Morro Bay.
+
+The full-state map still uses the `maps` California outline (`install.packages("maps")`) for context. At that scale the offset is smaller than a point. For a true land layer at any zoom, `tigris::states(cb = TRUE)` (US Census 1:500k) is accurate enough.
+
+```{r ca-basemap}
+ca <- st_as_sf(maps::map("state", regions = "california", plot = FALSE, fill = TRUE)) %>%
+  st_transform(4326)
+
+zone_labels <- c(n = "Nearshore (0-30 m)", o = "Offshore (30-60 m)",
+                 b = "Bay / slough", w = "Way offshore (>10 km)")
+
+# USGS habitat polygons as the coastline background (exactly registered with the points)
+habitat_bg <- shp19 %>%
+  filter(ZONE_CODE != "w") %>%          # single 'way offshore' polygon; not needed for the outline
+  st_transform(4326) %>%
+  # named 'hab_zone' (not 'zone') so the background is drawn in every facet of faceted maps
+  mutate(hab_zone = factor(zone_labels[ZONE_CODE], levels = zone_labels))
+
+habitat_fill <- scale_fill_manual(values = c("Nearshore (0-30 m)" = "#b9d7ee",
+                                             "Offshore (30-60 m)" = "#e1edf7",
+                                             "Bay / slough"       = "#b9dfc6"),
+                                  name = "Habitat zone", drop = TRUE)
+
+# Range-scale maps: dissolve the ~2,000 polygons into one band per zone so there are
+# no internal edges. The band's landward edge is the coastline.
+habitat_band <- habitat_bg %>%
+  group_by(hab_zone) %>%
+  summarise(do_union = TRUE) %>%
+  st_make_valid()
+
+habitat_layer <- list(
+  geom_sf(data = habitat_band, aes(fill = hab_zone), colour = "grey45", linewidth = 0.25),
+  habitat_fill
+)
+
+# Close-up maps: keep the individual polygon outlines
+habitat_layer_detail <- list(
+  geom_sf(data = habitat_bg, aes(fill = hab_zone), colour = "grey70", linewidth = 0.15, alpha = 0.7),
+  habitat_fill
+)
+
+# ---- What counts as "zero"? -------------------------------------------------
+# The 10 km smoothing spreads fractional otters along the coast, so very few points
+# are exactly 0 (2019: 8 of 993 ATOS points, 15 nearshore and 346 offshore polygons).
+# zero_cutoff = 0   -> only exact zeros are white
+# zero_cutoff = 0.5 -> anything under half an otter is white as well (~230 more ATOS points)
+zero_cutoff <- 0
+# -----------------------------------------------------------------------------
+
+# Split ATOS points into zero and non-zero. Zeros are drawn in white, off the viridis
+# scale, so the colour range only covers points that actually have otters.
+# Sort so the highest values are drawn on top.
+otters_2019_map <- otters_2019_atos %>%
+  filter(otters_3yr > zero_cutoff) %>%
+  arrange(otters_3yr)
+
+otters_2019_map0 <- otters_2019_atos %>%
+  filter(otters_3yr <= zero_cutoff)
+
+# White points with a thin grey outline (a grey point drawn slightly larger underneath),
+# so zeros stay visible on the white background and the light-blue habitat band.
+# Add this layer BEFORE the coloured points so zeros sit underneath.
+zero_points <- function(data, size, mapping = NULL) {
+  list(
+    geom_sf(data = data, mapping = mapping, colour = "grey40", size = size + 0.6),
+    geom_sf(data = data, mapping = mapping, colour = "white",  size = size)
+  )
+}
+
+otter_scale <- scale_colour_viridis_c(name = "otters / ATOS\n(3-yr avg)",
+                                      direction = -1)   # low = light yellow, high = dark
+```
+
+```{r map-2019-state, fig.height=7, fig.width=6}
+# Whole state, for context
+bb <- st_bbox(otters_2019_atos)   # all points, including zeros at the range tips
+ggplot() +
+  geom_sf(data = ca, fill = "grey92", colour = "grey50") +
+  habitat_layer +
+  zero_points(otters_2019_map0, size = 0.8) +
+  geom_sf(data = otters_2019_map, aes(colour = otters_3yr), size = 0.8) +
+  annotate("rect", xmin = bb["xmin"] - 0.15, xmax = bb["xmax"] + 0.15,
+           ymin = bb["ymin"] - 0.15, ymax = bb["ymax"] + 0.15,
+           fill = NA, colour = "black", linetype = "dashed") +
+  otter_scale +
+  labs(title = "Southern sea otter, 2017-2019 3-yr average",
+       subtitle = paste0("black box shows area of USGS census summary 2019 (2017-2019)")) +
+  theme_minimal()
+
+#ggsave(here::here("Outputs", "otters", "whole_state_2019.png"))
+```
+
+```{r map-2019-zoom, fig.height=7, fig.width=7}
+# Zoomed to the otter range (the dashed box above)
+ggplot() +
+  habitat_layer +
+  zero_points(otters_2019_map0, size = 1) +
+  geom_sf(data = otters_2019_map, aes(colour = otters_3yr), size = 1) +
+  otter_scale +
+  coord_sf(xlim = c(bb["xmin"] - 0.15, bb["xmax"] + 0.15),
+           ylim = c(bb["ymin"] - 0.15, bb["ymax"] + 0.15), expand = FALSE) +
+  labs(title = "Southern sea otter range, 2017-2019 3-yr average",
+       subtitle = paste0("USGS census summary 2019; white points = ", zero_cutoff, " otters or fewer"),
+       x = NULL, y = NULL) +
+  theme_minimal()
+
+ggsave(here::here("Outputs", "otters", "zoom_2019.png"))
+```
+
+## Nearshore vs offshore vs bay polygons (2017-2019 dataset)
+
+Here every **polygon** is its own point, not summed to ATOS. Each ATOS point usually has two: nearshore (`n`, 0-30 m) and offshore (`o`, 30-60 m). Elkhorn Slough (ATOS 321) and Morro Bay (ATOS 826) also have a third, bay (`b`), polygon. Polygons with 0 otters are shown as white points, off the colour scale.
+
+The colour scale is square-root transformed (Otherwise the ~100 otters in Elkhorn Slough make every other point look the same.)
+
+```{r zone-prep}
+otters_2019_zone <- otters_2019_poly %>%
+  filter(otters_3yr > zero_cutoff) %>%
+  mutate(zone = factor(zone_labels[ZONE_CODE], levels = zone_labels)) %>%
+  arrange(otters_3yr)
+
+# Zero polygons (white points). The single 'way offshore' polygon (900w, 0 otters)
+# is left out so it doesn't add a fourth facet.
+otters_2019_zone0 <- otters_2019_poly %>%
+  filter(otters_3yr <= zero_cutoff, ZONE_CODE != "w") %>%
+  mutate(zone = factor(zone_labels[ZONE_CODE], levels = zone_labels))
+
+zone_scale <- scale_colour_viridis_c(name = "otters / polygon\n(3-yr avg)",
+                                     direction = -1, trans = "sqrt",
+                                     breaks = c(1, 5, 10, 25, 50, 100))
+
+# How the otters split between zones
+otters_2019_poly %>% st_drop_geometry() %>%
+  group_by(ZONE_CODE) %>%
+  summarise(n_polygons = n(), otters = round(sum(otters_3yr)),
+            pct = round(100 * sum(otters_3yr) / sum(otters_2019_poly$otters_3yr), 1))
+```
+
+```{r map-2019-zones, fig.height=7, fig.width=11}
+facet_order <- c("Offshore (30-60 m)", "Nearshore (0-30 m)", "Bay / slough")
+
+ggplot() +
+  habitat_layer +
+  zero_points(mutate(otters_2019_zone0, zone = factor(zone, levels = facet_order)), size = 0.9) +
+  geom_sf(data = mutate(otters_2019_zone, zone = factor(zone, levels = facet_order)),
+          aes(colour = otters_3yr), size = 0.9) +
+  zone_scale +
+  facet_wrap(~ zone, nrow = 1, drop = TRUE) +
+  coord_sf(xlim = c(bb["xmin"] - 0.15, bb["xmax"] + 0.15),
+           ylim = c(bb["ymin"] - 0.15, bb["ymax"] + 0.15), expand = FALSE) +
+  scale_x_continuous(breaks = c(-122, -121)) +
+  labs(title = "Otters by habitat zone, 2017-2019 3-yr average",
+       subtitle = paste0("One point per census polygon; white points = ", zero_cutoff, " otters or fewer"),
+       x = NULL, y = NULL) +
+  theme_minimal()
+
+#ggsave(here::here("Outputs", "otters", "zone_comparison.png"), width = 11)
+```
+At full-range scale the nearshore and offshore points of one ATOS sit almost on top of each other, so this close-up of Monterey Bay shows them side by side. Elkhorn Slough is the third point inland at Moss Landing.
+
+```{r map-2019-zones-monterey, fig.height=7, fig.width=7}
+ggplot() +
+  habitat_layer_detail +
+  zero_points(otters_2019_zone0, size = 2.2, mapping = aes(shape = zone)) +
+  geom_sf(data = otters_2019_zone, aes(colour = otters_3yr, shape = zone), size = 2.2) +
+  zone_scale +
+  scale_shape_manual(values = c("Nearshore (0-30 m)" = 16, "Offshore (30-60 m)" = 17,
+                                "Bay / slough" = 15, "Way offshore (>10 km)" = 4),
+                     name = "Zone") +
+  coord_sf(xlim = c(-122.05, -121.70), ylim = c(36.50, 36.90), expand = FALSE) +
+  labs(title = "Monterey Bay (incl Elkhorn Slough): polygons by zone, 2017-2019",
+       subtitle = paste0("White points = ", zero_cutoff, " otters or fewer"), x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+```{r map-2019-zones-morro, fig.height=7, fig.width=7}
+ggplot() +
+  habitat_layer_detail +
+  zero_points(otters_2019_zone0, size = 2.2, mapping = aes(shape = zone)) +
+  geom_sf(data = otters_2019_zone, aes(colour = otters_3yr, shape = zone), size = 2.2) +
+  zone_scale +
+  scale_shape_manual(values = c("Nearshore (0-30 m)" = 16, "Offshore (30-60 m)" = 17,
+                                "Bay / slough" = 15, "Way offshore (>10 km)" = 4),
+                     name = "Zone") +
+  coord_sf(xlim = c(-121.0, -120.75), ylim = c(35.25, 35.50), expand = FALSE) +
+  labs(title = "Morro Bay: polygons by zone, 2017-2019",
+       subtitle = paste0("White points = ", zero_cutoff, " otters or fewer"), x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+# 4. Full time series with lat/long (all years)
+
+`census_all` (section 2) already holds every year: the CSV for 1985-2014 and the yearly shapefiles after that.
+
+The 2019 shapefile holds the largest polygon set, so I use it as the geometry lookup. A few older polygons (about 300 IDs, mostly the range tips in 1999-2001 and 2008-2009) are missing from it. They hold very few otters (at most ~44 in any year), and below they are kept with NA coordinates rather than dropped silently.
+
+```{r ts-latlong}
+poly_lookup <- otters_2019_poly %>%
+  st_drop_geometry() %>%
+  select(POLY_ID, ATOS_ID, ZONE_CODE, lon, lat)
+
+otters_ts_poly <- census_all %>%
+  left_join(poly_lookup %>% select(POLY_ID, lon, lat), by = "POLY_ID")
+
+# How much is lost without geometry?
+otters_ts_poly %>%
+  group_by(Year) %>%
+  summarise(otters_no_coords = sum(otters_3yr[is.na(lat)]),
+            otters_total     = sum(otters_3yr)) %>%
+  filter(otters_no_coords > 0)
+
+# ATOS-level long table: Year x ATOS x lat/lon
+atos_lookup <- otters_2019_atos %>% st_drop_geometry() %>% select(ATOS_ID, lon, lat)
+
+otters_ts_atos <- otters_ts_poly %>%
+  group_by(Year, avg_window, ATOS_ID) %>%
+  summarise(otters_3yr = sum(otters_3yr),
+            pupratio   = first(pupratio),
+            trend5yr   = first(trend5yr), .groups = "drop") %>%
+  left_join(atos_lookup, by = "ATOS_ID")
+
+glimpse(otters_ts_atos)
+```
+
+Pick the panels here. Any year in `census_all` works. For panels with no shared census years, keep them at least 3 years apart, e.g. `c(2010, 2013, 2016, 2019)`.
+
+```{r ts-plot, fig.height=9}
+ts_years <- c(1985, 1990, 1995, 2000, 2005, 2010, 2015, 2019)
+
+otters_ts_atos %>%
+  filter(Year %in% ts_years, !is.na(lat)) %>%
+  ggplot(aes(lat, otters_3yr)) +
+  geom_line() +
+  facet_wrap(~ avg_window, ncol = 1) +
+  scale_x_reverse() +
+  labs(x = "Latitude (north - south)", y = "otters per ATOS (3-yr avg)") +
+  theme_minimal()
+
+#ggsave(here::here("Outputs", "otters", "timeseries_line.png"), width = 10, height = 8)
+```
+
