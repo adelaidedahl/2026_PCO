@@ -1,0 +1,24 @@
+---
+title: "PISCO"
+output: html_document
+date: "2026-10-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries, echo = FALSE, warning = FALSE}
+library(here)
+library(tidyverse)
+```
+
+read csvs
+```{r}
+pco_fish_raw <- read_csv(here::here("Data", "PISCO", "PISCO_kelpforest_fish.1.11.csv"))
+pco_swath_raw <- read_csv(here::here("Data", "PISCO", "PISCO_kelpforest_swath.1.11.csv"))
+pco_taxa_raw <- read_csv(here::here("Data", "PISCO", "PISCO_kelpforest_taxon_table.1.11.csv"))
+```
+
+
